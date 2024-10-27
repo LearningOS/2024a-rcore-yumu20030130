@@ -51,21 +51,51 @@ impl MemorySet {
     pub fn token(&self) -> usize {
         self.page_table.token()
     }
-    /// Assume that no conflicts. -> handle conflicts
+
+    /// Check mapped status in the range of [start_va, end_va) 
+    /// 0 -> all unmapped  -1 -> others
+    pub fn check_mapped_status(&self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        let mut start = start_va.floor();
+        let end = end_va.ceil();
+        while start < end {
+
+            /// Attention! find_pte does not judge whether the pte is valid.
+            let pte = self.page_table.find_pte(start);
+            if pte.is_some() && pte.unwrap().is_valid() {
+                println!("conflict_vpn: {:?}", start);
+                return -1;
+            }
+            start.step();
+        }
+        0
+    }
+    /// Assume that no conflicts. 
     pub fn insert_framed_area(
         &mut self,
         start_va: VirtAddr,
         end_va: VirtAddr,
         permission: MapPermission,
-    ) -> isize{
-        if self.page_table.find_pte(start_va.floor()).is_some() {
-            return -1;
-        }
+    ) {
         self.push(
             MapArea::new(start_va, end_va, MapType::Framed, permission),
             None,
         );
-        0
+    }
+    /// Assume that no conflicts.
+    pub fn remove_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+    ) -> isize {
+        for (i, area) in self.areas.iter().enumerate() {
+            if area.vpn_range.get_start() == start_va.floor() && area.vpn_range.get_end() == end_va.ceil() {
+                let area = &mut self.areas[i];
+                area.unmap(&mut self.page_table);
+                self.areas.remove(i);
+                return 0;
+            }
+        }
+        -1
     }
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
         map_area.map(&mut self.page_table);

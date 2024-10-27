@@ -59,7 +59,7 @@ impl MemorySet {
         let end = end_va.ceil();
         while start < end {
 
-            /// Attention! find_pte does not judge whether the pte is valid.
+            // Attention! find_pte does not judge whether the pte is valid.
             let pte = self.page_table.find_pte(start);
             if pte.is_some() && pte.unwrap().is_valid() {
                 println!("conflict_vpn: {:?}", start);

@@ -58,9 +58,13 @@ use fs::*;
 use process::*;
 
 use crate::fs::Stat;
-
+use crate::config::MAX_SYSCALL_NUM;
+use crate::task::current_task;
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
+    if syscall_id < MAX_SYSCALL_NUM {
+        current_task().unwrap().inner_exclusive_access().add_syscall_times(syscall_id);
+    }
     match syscall_id {
         SYSCALL_OPEN => sys_open(args[1] as *const u8, args[2] as u32),
         SYSCALL_CLOSE => sys_close(args[0]),

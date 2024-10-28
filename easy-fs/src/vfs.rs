@@ -73,6 +73,96 @@ impl Inode {
             })
         })
     }
+    /// get the stat of the inode (inode_id, nlink)
+    pub fn get_stat(&self) -> (u64, u32) {
+        let fs = self.fs.lock();
+        let mut ino: u64 = 0;
+        let mut nlink: u32 = 0;
+        self.read_disk_inode(|disk_inode| {
+            ino = fs.get_inode_id(self.block_id as u32, self.block_offset) as u64;
+            nlink = disk_inode.nlink as u32;
+        });
+        (ino, nlink)
+    }
+    /// create a hard link to a file
+    pub fn create_link(&self, src: &str, dst: &str) -> i32 {
+        if src == dst {
+            return -1;
+        }
+        // find the inode and id of the target file
+        let mut fs = self.fs.lock();
+        let mut id: u32 = 0;
+        let target_inode = self.read_disk_inode(|disk_inode| {
+            self.find_inode_id(src, disk_inode).map(|inode_id| {
+                id = inode_id;
+                let (block_id, block_offset) = fs.get_disk_inode_pos(inode_id);
+                Arc::new(Self::new(
+                    block_id,
+                    block_offset,
+                    self.fs.clone(),
+                    self.block_device.clone(),
+                ))
+            })
+        });
+        if target_inode.is_none() {
+            return -1;
+        }
+
+        // increase nlink of target inode
+        let target_inode = target_inode.unwrap();
+        target_inode.modify_disk_inode(|disk_inode| {
+            disk_inode.add_nlink(1);
+        });
+
+        // add dirent to the current inode
+        self.modify_disk_inode(|disk_inode| {
+            let entries = disk_inode.size as usize / DIRENT_SZ;
+            self.increase_size(((entries + 1) * DIRENT_SZ) as u32, disk_inode, &mut fs);
+            let offset = entries * DIRENT_SZ;
+            let dirent = DirEntry::new(dst, id);
+            disk_inode.write_at(offset, dirent.as_bytes(), &self.block_device);
+        });
+        block_cache_sync_all();
+        0
+    }
+
+    /// delete a hard link to a file 
+    pub fn delete_link(&self, src: &str) -> i32 {
+        // find the inode and id of the target file
+        let target_inode = self.find(src);
+        if target_inode.is_none() {
+            return -1;
+        }
+
+        // decrease nlink of target inode
+        let mut need_to_erase = false;
+        let target_inode = target_inode.unwrap();
+        target_inode.modify_disk_inode(|disk_inode| {
+            disk_inode.sub_nlink(1);
+            if disk_inode.nlink == 0 {
+                need_to_erase = true;
+            }
+        });
+        if need_to_erase {
+            target_inode.clear(); // Attention: please check if the fs is unlocked
+        }
+        // delete target dirent in the current inode
+        self.modify_disk_inode(|disk_inode: &mut DiskInode| {
+            let num_entries = disk_inode.size as usize / DIRENT_SZ;
+            for i in 0..num_entries {
+                let mut dirent = DirEntry::empty();
+                disk_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device);
+                if dirent.name() == src {
+                    disk_inode.read_at((num_entries - 1) * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device);
+                    disk_inode.write_at(i * DIRENT_SZ, dirent.as_bytes(), &self.block_device);
+                    disk_inode.write_at((num_entries - 1) * DIRENT_SZ, DirEntry::empty().as_bytes(), &self.block_device);
+                }
+            }
+            disk_inode.size -= DIRENT_SZ as u32;
+        });
+        block_cache_sync_all();
+        0       
+    }
     /// Increase the size of a disk inode
     fn increase_size(
         &self,

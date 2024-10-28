@@ -1,14 +1,18 @@
 //! Process management syscalls
 use alloc::sync::Arc;
-
+use crate::mm::translated_byte_buffer;
+use crate::task::current_user_token;
+use core::mem::size_of;
+// use crate::mm::MapPermission;
 use crate::{
-    config::MAX_SYSCALL_NUM,
+    config::{MAX_SYSCALL_NUM, PAGE_SIZE},
     loader::get_app_data_by_name,
-    mm::{translated_refmut, translated_str},
+    mm::{translated_refmut, translated_str, VirtAddr, MapPermission},
     task::{
-        add_task, current_task, current_user_token, exit_current_and_run_next,
+        add_task, current_task, exit_current_and_run_next,
         suspend_current_and_run_next, TaskStatus,
     },
+    timer::{get_time_ms, get_time_us},
 };
 
 #[repr(C)]
@@ -114,44 +118,107 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
+/// copy data from src(physical address) to dst(virtual address)
+fn copy_paddr_vaddr<T> (src: &T, dst: *mut T) {
+    let src_array = unsafe { 
+        core::slice::from_raw_parts(src as *const _ as *const u8, size_of::<T>()) 
+    };
+    let buffers = translated_byte_buffer(current_user_token(), dst as *const u8, size_of::<T>());
+    let mut start = 0;
+    for buffer in buffers {
+        if size_of::<T>() - start > buffer.len() {
+            buffer.copy_from_slice(&src_array[start..start + buffer.len()]);
+        }
+        else {
+            buffer.copy_from_slice(&src_array[start..]);
+        }
+        start += buffer.len();
+    } 
+}
+
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+    let current_task = current_task().unwrap();
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_get_time",
+        current_task.pid.0
     );
-    -1
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    copy_paddr_vaddr(&time_val, _ts);
+    0
 }
 
 /// YOUR JOB: Finish sys_task_info to pass testcases
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TaskInfo`] is splitted by two pages ?
 pub fn sys_task_info(_ti: *mut TaskInfo) -> isize {
+    let current_task = current_task().unwrap();
+    let current_task_inner = current_task.inner_exclusive_access();
     trace!(
-        "kernel:pid[{}] sys_task_info NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_task_info",
+        current_task.pid.0
     );
-    -1
+    let current_time = get_time_ms();
+    let start_time = current_task_inner.get_start_time();
+    let task_info = TaskInfo {
+        status: TaskStatus::Running,
+        syscall_times: (*current_task_inner.get_syscall_times()),
+        time: current_time - start_time,
+    };
+    copy_paddr_vaddr(&task_info, _ti);
+    0
 }
 
 /// YOUR JOB: Implement mmap.
 pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+    let current_task = current_task().unwrap();
+    let mut current_task_inner = current_task.inner_exclusive_access();   
     trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_mmap",
+        current_task.pid.0
     );
-    -1
+    if _start % PAGE_SIZE != 0  || _port & !0x7 != 0 || _port & 0x7 == 0 {
+        return -1;
+    }
+    let memory_set = current_task_inner.get_memory_set();
+    let start_va = VirtAddr(_start);
+    let end_va = VirtAddr(_start + _len);
+    println!("start_va: {:?}, end_va: {:?}", start_va, end_va);
+    unsafe {
+        if (*memory_set).check_mapped_status(start_va, end_va) != 0 { // mapped
+            return -1;
+        }
+        // please use union instead of & (& is no defined for MapPermission)
+        (*memory_set).insert_framed_area(start_va, 
+                            end_va, 
+                            MapPermission::from_bits((_port << 1) as u8).unwrap().union(MapPermission::U));
+        0
+    }
 }
 
 /// YOUR JOB: Implement munmap.
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+    let current_task = current_task().unwrap();
+    let mut current_task_inner = current_task.inner_exclusive_access();   
     trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_munmap",
+        current_task.pid.0
     );
-    -1
+    if _start % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let memory_set = current_task_inner.get_memory_set();
+    let start_va = VirtAddr(_start);
+    let end_va = VirtAddr(_start + _len);
+    unsafe {
+        (*memory_set).remove_framed_area(start_va, end_va)
+    }
 }
 
 /// change data segment size
@@ -167,18 +234,37 @@ pub fn sys_sbrk(size: i32) -> isize {
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
 pub fn sys_spawn(_path: *const u8) -> isize {
+    let current_task = current_task().unwrap();
     trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_spawn",
+        current_task.pid.0
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, _path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let new_task = current_task.spawn(data);
+        let new_pid = new_task.pid.0;
+        // add new task to scheduler
+        add_task(new_task);
+        
+        new_pid as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
 pub fn sys_set_priority(_prio: isize) -> isize {
+    let current_task = current_task().unwrap();
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_set_priority",
+        current_task.pid.0
     );
-    -1
+    if _prio < 2 {
+        -1
+    }
+    else {
+        current_task.inner_exclusive_access().set_priority(_prio as usize);
+        _prio
+    }
 }

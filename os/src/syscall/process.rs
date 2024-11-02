@@ -6,7 +6,10 @@ use crate::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags, TaskStatus,
     },
+    timer::get_time_us,
 };
+use crate::mm::translated_byte_buffer;
+use core::mem::size_of;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 #[repr(C)]
@@ -157,17 +160,39 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
     }
 }
 
-/// get_time syscall
-///
+/// copy data from src(physical address) to dst(virtual address)
+fn copy_paddr_vaddr<T> (src: &T, dst: *mut T) {
+    let src_array = unsafe { 
+        core::slice::from_raw_parts(src as *const _ as *const u8, size_of::<T>()) 
+    };
+    let buffers = translated_byte_buffer(current_user_token(), dst as *const u8, size_of::<T>());
+    let mut start = 0;
+    for buffer in buffers {
+        if size_of::<T>() - start > buffer.len() {
+            buffer.copy_from_slice(&src_array[start..start + buffer.len()]);
+        }
+        else {
+            buffer.copy_from_slice(&src_array[start..]);
+        }
+        start += buffer.len();
+    } 
+}
+
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    copy_paddr_vaddr(&time_val, _ts);
+    0
 }
 
 /// task_info syscall
